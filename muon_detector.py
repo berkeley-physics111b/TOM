@@ -319,6 +319,14 @@ class AcquisitionManager:
         buf = max(4096, int(self.sample_rate_hz * 200e-6))
         buf = min(buf, 32768)
 
+        # Track the last-applied analog front-end (AFE) config so we only
+        # re-run analog_in_reset()/set_range()/set_attenuation()/set_offset()
+        # when something actually changed. Those calls engage physical
+        # relays on the front end — repeating them on every single triggered
+        # capture (as opposed to only when settings change) causes audible
+        # relay clicking and adds settling-time deadtime for no benefit.
+        last_afe_config = None
+
         while not self._stop_event.is_set():
             with self._lock:
                 dev = self.device
@@ -334,6 +342,10 @@ class AcquisitionManager:
                             "y_offset":    self.ch1_offset_v,
                             "y_range":     self.ch1_range_v},
                     }
+                    afe_config = (True, buf, self.ch0_range_v, self.ch1_range_v,
+                                  self.ch0_attenuation, self.ch1_attenuation,
+                                  self.ch0_offset_v, self.ch1_offset_v)
+                    force_afe = (afe_config != last_afe_config)
                     result = dev.analog_in_capture_multiple(
                         channel_settings=channel_settings,
                         sample_rate_hz=self.sample_rate_hz,
@@ -342,10 +354,16 @@ class AcquisitionManager:
                         trigger_level_v=self.trigger_level_v,
                         auto_timeout_s=self.auto_timeout_s,
                         timeout_s=self.acquisition_timeout_s,
+                        force_afe_setup=force_afe,
                     )
                     ch0 = result[0]
                     ch1 = result[1]
+                    last_afe_config = afe_config
                 else:
+                    afe_config = (False, buf, self.ch0_range_v, None,
+                                  self.ch0_attenuation, None,
+                                  self.ch0_offset_v, None)
+                    force_afe = (afe_config != last_afe_config)
                     ch0 = dev.analog_in_capture(
                         channel=0,
                         sample_rate_hz=self.sample_rate_hz,
@@ -356,8 +374,10 @@ class AcquisitionManager:
                         trigger_channel=self.trigger_channel,
                         auto_timeout_s=self.auto_timeout_s,
                         timeout_s=self.acquisition_timeout_s,
+                        force_afe_setup=force_afe,
                     )
                     ch1 = None
+                    last_afe_config = afe_config
 
                 if not self.queue.full():
                     self.queue.put_nowait({"ch0": ch0, "ch1": ch1})
@@ -368,6 +388,7 @@ class AcquisitionManager:
                 if self._stop_event.is_set():
                     break
                 self._set_status(f"Capture error: {e}")
+                last_afe_config = None  # force a clean re-setup after an error
                 time.sleep(0.5)
 
     def _set_status(self, msg):
@@ -1413,6 +1434,14 @@ class TomographyAcquisitionManager(AcquisitionManager):
         self.window_stop_us = 40.0   # kept in sync by TomographyTab before Start
 
     def _capture_loop(self):
+        # Track the last-applied analog front-end (AFE) config so we only
+        # re-run analog_in_reset()/set_range()/set_attenuation()/set_offset()
+        # when something actually changed — those calls engage physical
+        # relays on the front end, and re-running them every single
+        # triggered capture (rather than only when settings change) causes
+        # audible relay clicking and adds settling-time deadtime.
+        last_afe_config = None
+
         while not self._stop_event.is_set():
             with self._lock:
                 dev = self.device
@@ -1429,6 +1458,10 @@ class TomographyAcquisitionManager(AcquisitionManager):
             # hardware trigger without truncating the analysis window.
             needed = int(self.sample_rate_hz * (self.window_stop_us + 5.0) * 1e-6)
             buf = max(2048, min(int(needed * 2.2), 32768))
+            afe_config = (buf, self.ch0_range_v, self.ch1_range_v,
+                          self.ch0_attenuation, self.ch1_attenuation,
+                          self.ch0_offset_v, self.ch1_offset_v)
+            force_afe = (afe_config != last_afe_config)
             try:
                 channel_settings = {
                     0: {"attenuation": self.ch0_attenuation,
@@ -1446,12 +1479,15 @@ class TomographyAcquisitionManager(AcquisitionManager):
                     trigger_level_v=self.trigger_level_v,
                     auto_timeout_s=self.auto_timeout_s,   # 0 = strict Normal trigger, no wasted auto-fires
                     timeout_s=self.acquisition_timeout_s,
+                    force_afe_setup=force_afe,
                 )
+                last_afe_config = afe_config
                 if not self.queue.full():
                     self.queue.put_nowait({"ch0": result[0], "ch1": result[1]})
             except TimeoutError:
                 pass
             except Exception as e:
+                last_afe_config = None  # force a clean re-setup after an error
                 if self._stop_event.is_set():
                     break
                 self._set_status(f"Capture error: {e}")

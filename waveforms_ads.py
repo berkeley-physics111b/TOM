@@ -564,6 +564,7 @@ class WaveFormsADS:
         trigger_condition: int = DwfTriggerSlopeRise,
         auto_timeout_s: float = 1.0,
         timeout_s: float = 5.0,
+        force_afe_setup: bool = True,
     ) -> np.ndarray:
         """
         Perform a single triggered (or auto-triggered) capture on *channel*.
@@ -593,20 +594,33 @@ class WaveFormsADS:
             Auto-trigger timeout (seconds).  Use 0 for strict "Normal" trigger.
         timeout_s : float
             Host-side acquisition timeout before raising TimeoutError.
+        force_afe_setup : bool
+            If True (default), fully resets the instrument and re-applies
+            channel enable/range/offset/attenuation before capturing. These
+            channel-range/attenuation calls engage physical relays on the
+            analog front end, so re-running them on every single triggered
+            capture in a tight loop causes audible relay clicking and adds
+            settling-time deadtime. Pass False to skip the reset and channel
+            setup and just re-arm the trigger for another capture with the
+            *same* channel configuration as the previous call.
 
         Returns
         -------
         np.ndarray
             Array of ``buffer_size`` voltage samples (float64, volts).
         """
-        self.analog_in_reset()
-        self.analog_in_set_sample_rate(sample_rate_hz)
-        self.analog_in_set_buffer_size(buffer_size)
-        self.analog_in_set_acquisition_mode(acqmodeSingle)
-        self.analog_in_set_offset(channel, y_offset)
-        self.analog_in_set_range(channel, y_range)
-        self.analog_in_set_attenuation(channel, attenuation)
-        self.analog_in_channel_enable(channel)
+        if force_afe_setup:
+            self.analog_in_reset()
+            self.analog_in_set_sample_rate(sample_rate_hz)
+            self.analog_in_set_buffer_size(buffer_size)
+            self.analog_in_set_acquisition_mode(acqmodeSingle)
+            self.analog_in_set_offset(channel, y_offset)
+            self.analog_in_set_range(channel, y_range)
+            self.analog_in_set_attenuation(channel, attenuation)
+            self.analog_in_channel_enable(channel)
+        else:
+            self.analog_in_set_sample_rate(sample_rate_hz)
+            self.analog_in_set_buffer_size(buffer_size)
 
         if trigger_level_v is not None:
             trig_ch = channel if trigger_channel is None else trigger_channel
@@ -645,6 +659,7 @@ class WaveFormsADS:
         trigger_condition: int = DwfTriggerSlopeRise,
         auto_timeout_s: float = 1.0,
         timeout_s: float = 5.0,
+        force_afe_setup: bool = True,
     ) -> dict:
         """More generalized version of analog in capture for easy settings for multiple channels.
 
@@ -667,6 +682,16 @@ class WaveFormsADS:
                 Auto-trigger timeout (seconds).  Use 0 for strict "Normal" trigger.
             timeout_s : float
                 Host-side acquisition timeout before raising TimeoutError.
+            force_afe_setup : bool
+                If True (default), fully resets the instrument and re-applies
+                channel enable/range/offset/attenuation before capturing.
+                These channel-range/attenuation calls engage physical
+                relays on the analog front end, so re-running them on every
+                single triggered capture in a tight loop causes audible
+                relay clicking and adds settling-time deadtime. Pass False
+                to skip the reset and channel (range/offset/attenuation)
+                setup and just re-arm the trigger for another capture with
+                the *same* channel configuration as the previous call.
 
         Returns:
             dict:
@@ -676,19 +701,26 @@ class WaveFormsADS:
         if trigger_level_v is not None and trigger_channel is None:
             raise TriggerWithoutChannelError
 
-        self.analog_in_reset()
-        self.analog_in_set_sample_rate(sample_rate_hz)
-        self.analog_in_set_buffer_size(buffer_size)
-        self.analog_in_set_acquisition_mode(acqmodeSingle)
-
         channels = channel_settings.keys()
 
-        for channel in channels:
-            self.analog_in_channel_enable(channel)
-            y_offset, y_range, attenuation = channel_settings[channel]["y_offset"], channel_settings[channel]["y_range"], channel_settings[channel]["attenuation"]
-            self.analog_in_set_offset(channel, y_offset)
-            self.analog_in_set_range(channel, y_range)
-            self.analog_in_set_attenuation(channel, attenuation)
+        if force_afe_setup:
+            self.analog_in_reset()
+            self.analog_in_set_sample_rate(sample_rate_hz)
+            self.analog_in_set_buffer_size(buffer_size)
+            self.analog_in_set_acquisition_mode(acqmodeSingle)
+
+            for channel in channels:
+                self.analog_in_channel_enable(channel)
+                y_offset, y_range, attenuation = channel_settings[channel]["y_offset"], channel_settings[channel]["y_range"], channel_settings[channel]["attenuation"]
+                self.analog_in_set_offset(channel, y_offset)
+                self.analog_in_set_range(channel, y_range)
+                self.analog_in_set_attenuation(channel, attenuation)
+        else:
+            # Digital-only settings (no relays involved) are cheap to
+            # re-apply every capture and keep this call correct even if the
+            # caller changes sample rate / buffer size without a full re-setup.
+            self.analog_in_set_sample_rate(sample_rate_hz)
+            self.analog_in_set_buffer_size(buffer_size)
 
         if trigger_level_v is not None:
             self.analog_in_set_trigger_source(trigsrcDetectorAnalogIn)
