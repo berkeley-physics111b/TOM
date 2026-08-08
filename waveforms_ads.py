@@ -685,7 +685,7 @@ class WaveFormsADS:
 
         for channel in channels:
             self.analog_in_channel_enable(channel)
-            y_offset, y_range, attenuation = channels[channel]["y_offset"], channels[channel]["y_range"], channels[channel]["attenuation"]
+            y_offset, y_range, attenuation = channel_settings[channel]["y_offset"], channel_settings[channel]["y_range"], channel_settings[channel]["attenuation"]
             self.analog_in_set_offset(channel, y_offset)
             self.analog_in_set_range(channel, y_range)
             self.analog_in_set_attenuation(channel, attenuation)
