@@ -514,6 +514,43 @@ def analyse_channel(raw, fs, first_trig, second_trig, expected_pulses,
             a1, fwhm1_us, a2, fwhm2_us)
 
 
+def find_stoppage_in_channel(raw, fs, cross, second_trig,
+                              start_idx, stop_idx,
+                              do_filter, b=None, a_coef=None):
+    """
+    Check a SINGLE channel's own trace for the stoppage (second-pulse)
+    trigger crossing inside the window [start_idx, stop_idx), measured
+    from `cross` (the coincidence crossing index found on the Ch0*Ch1
+    product trace).
+
+    Used for tomography stoppage detection instead of checking the
+    product trace, because a stopping muon's decay pulse shows up in only
+    one detector — a product of the two channels would suppress a
+    single-channel pulse rather than reveal it.
+
+    Returns (found, t2_us, a2, fwhm2_us):
+      found  : True if a crossing of `second_trig` was seen in the window
+      t2_us  : buffer-absolute time of that crossing (NaN if not found)
+      a2     : pulse-2 height (NaN if not found)
+      fwhm2_us : pulse-2 FWHM (NaN if not found)
+    """
+    chopped = raw[cross:]
+    if stop_idx > len(chopped):
+        return False, np.nan, np.nan, np.nan
+
+    win  = chopped[start_idx:stop_idx]
+    filt = (sig.filtfilt(b, a_coef, win)
+            if (do_filter and len(win) > 9) else win.copy())
+
+    idx = find_first_trigger_index(filt, second_trig)
+    if idx is None:
+        return False, np.nan, np.nan, np.nan
+
+    t2_us        = (cross + start_idx + idx) / fs * 1e6
+    a2, fwhm2_us = measure_pulse(filt, fs)
+    return True, t2_us, a2, fwhm2_us
+
+
 # ===========================================================================
 # ADS / Acquisition panel  (merged – no separate ADS Hardware section)
 # ===========================================================================
@@ -1505,11 +1542,18 @@ class TomographyTab:
     Pipeline: hardware-triggers on the configured channel/level, always
     captures Ch0+Ch1 together (shared buffer), forms the product trace
     Ch0*Ch1, and reuses `analyse_channel` (same logic as the Muon Lifetime
-    tab) on that product trace:
-      - passes first trigger (coincidence threshold) anywhere in the trace
-        -> coincidence
-      - AND passes a second trigger (stoppage threshold) inside the
-        [window_start, window_stop] region -> stoppage
+    tab) on that product trace to find the coincidence:
+      - passes first trigger (coincidence threshold) anywhere in the
+        product trace -> coincidence
+
+    The stoppage (second-pulse) check is NOT done on the product trace,
+    because a stopping muon's decay pulse appears in only ONE of the two
+    detectors — multiplying the channels together would suppress it, since
+    the other channel has no second pulse there and the product stays near
+    zero. Instead, once a coincidence is found, Ch0 and Ch1 are each
+    checked independently for a crossing of the stoppage threshold inside
+    the [window_start, window_stop] window following the coincidence:
+      - a crossing on EITHER channel (Ch0 or Ch1) -> stoppage
     """
 
     SAVE_MODES = ["stoppages only", "coincidences only", "all data"]
@@ -1822,10 +1866,14 @@ class TomographyTab:
                 continue
             product = ch0 * ch1
 
-            (pass1, pass2, cross,
-             t1, t2, dt,
-             a1, fwhm1, a2, fwhm2) = analyse_channel(
-                product, fs, coinc_thresh, stop_thresh, 2,
+            # Coincidence: first trigger crossing anywhere on the product
+            # trace. expected_pulses=1 here — the stoppage (second-pulse)
+            # check is done separately below, per channel, not on the
+            # product (see class docstring for why).
+            (pass1, _pass2_unused, cross,
+             t1, _t2_unused, _dt_unused,
+             a1, fwhm1, _a2_unused, _fwhm2_unused) = analyse_channel(
+                product, fs, coinc_thresh, stop_thresh, 1,
                 start_idx, stop_idx, holdoff_samples, do_filter, b, a_coef)
 
             if not pass1:
@@ -1836,12 +1884,41 @@ class TomographyTab:
                         "t1_us": np.nan, "t2_us": np.nan, "dt_us": np.nan,
                         "peak1_v": np.nan, "peak1_fwhm_us": np.nan,
                         "peak2_v": np.nan, "peak2_fwhm_us": np.nan,
+                        "stopped_channel": "",
                         "product_max_v2": float(np.max(product)),
                     })
                 continue
 
             new_coinc += 1
-            is_stoppage = bool(pass2)
+
+            # Stoppage: check Ch0 and Ch1 individually for the second-pulse
+            # crossing in the window, since a stopping muon's decay pulse
+            # appears in only one detector — checking the product would
+            # suppress it. Either channel crossing counts as a stoppage.
+            found0, t2_0, a2_0, fwhm2_0 = find_stoppage_in_channel(
+                ch0, fs, cross, stop_thresh, start_idx, stop_idx,
+                do_filter, b, a_coef)
+            found1, t2_1, a2_1, fwhm2_1 = find_stoppage_in_channel(
+                ch1, fs, cross, stop_thresh, start_idx, stop_idx,
+                do_filter, b, a_coef)
+
+            is_stoppage = found0 or found1
+            if found0 and found1:
+                # both channels show a second pulse (unusual) — report
+                # whichever crossed first
+                if t2_0 <= t2_1:
+                    t2, a2, fwhm2, stopped_channel = t2_0, a2_0, fwhm2_0, "ch0"
+                else:
+                    t2, a2, fwhm2, stopped_channel = t2_1, a2_1, fwhm2_1, "ch1"
+            elif found0:
+                t2, a2, fwhm2, stopped_channel = t2_0, a2_0, fwhm2_0, "ch0"
+            elif found1:
+                t2, a2, fwhm2, stopped_channel = t2_1, a2_1, fwhm2_1, "ch1"
+            else:
+                t2, a2, fwhm2, stopped_channel = np.nan, np.nan, np.nan, ""
+
+            dt = (t2 - t1) if is_stoppage else np.nan
+
             if is_stoppage:
                 new_stop += 1
 
@@ -1863,6 +1940,7 @@ class TomographyTab:
                     "t1_us": t1, "t2_us": t2, "dt_us": dt,
                     "peak1_v": a1, "peak1_fwhm_us": fwhm1,
                     "peak2_v": a2, "peak2_fwhm_us": fwhm2,
+                    "stopped_channel": stopped_channel,
                     "product_max_v2": float(np.max(product)),
                 })
 
