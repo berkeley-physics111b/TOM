@@ -1359,13 +1359,17 @@ class HistogramTab:
             ch0_ok = pass1_ch0 and pass2_ch0
             ch1_ok = use_ch1 and pass1_ch1 and pass2_ch1
 
-            # Record the event if EITHER channel independently qualifies.
-            # dt_inter only means anything when both channels fired.
-            if not (ch0_ok or ch1_ok):
-                continue
-
-            if ch0_ok and ch1_ok:
+            # dt_inter only needs both channels to have registered an entry
+            # (first) pulse — it's a punch-through timing measurement and is
+            # independent of whether either channel goes on to decay.
+            inter_ok = use_ch1 and pass1_ch0 and pass1_ch1
+            if inter_ok:
                 dt_inter = t1_ch1 - t1_ch0
+
+            # Record the event if a channel's own decay qualifies, OR we at
+            # least got a valid inter-channel entry-timing measurement.
+            if not (ch0_ok or ch1_ok or inter_ok):
+                continue
 
             self.passing_count += 1
             ts = datetime.datetime.now().isoformat(timespec="seconds")
