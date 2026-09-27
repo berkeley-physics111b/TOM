@@ -429,23 +429,33 @@ def measure_pulse(window, fs, half_width_only=False):
     height   = float(window[peak_idx])
     half_max = height / 2.0
 
-    right_idx = np.nan
-    for i in range(peak_idx, len(window) - 1):
-        if window[i] >= half_max >= window[i + 1]:
-            frac      = (window[i] - half_max) / (window[i] - window[i + 1])
-            right_idx = i + frac
-            break
+    def _crossing(seg):
+        # First k where seg[k] >= half_max >= seg[k+1], scanning outward
+        # from the peak (seg[0] == window[peak_idx]). Vectorized version
+        # of the same edge-detection scan find_first_trigger_index uses.
+        hit = np.where((seg[:-1] >= half_max) & (seg[1:] <= half_max))[0]
+        return int(hit[0]) if len(hit) > 0 else None
+
+    right_hit = _crossing(window[peak_idx:])
+    if right_hit is None:
+        right_idx = np.nan
+    else:
+        i    = peak_idx + right_hit
+        frac = (window[i] - half_max) / (window[i] - window[i + 1])
+        right_idx = i + frac
 
     if half_width_only:
         fwhm_us = (np.nan if np.isnan(right_idx)
                    else 2.0 * (right_idx - peak_idx) / fs * 1e6)
     else:
-        left_idx = np.nan
-        for i in range(peak_idx, 0, -1):
-            if window[i - 1] <= half_max <= window[i]:
-                frac     = (half_max - window[i - 1]) / (window[i] - window[i - 1])
-                left_idx = (i - 1) + frac
-                break
+        left_seg = window[:peak_idx + 1][::-1]
+        left_hit = _crossing(left_seg)
+        if left_hit is None:
+            left_idx = np.nan
+        else:
+            i    = peak_idx - left_hit
+            frac = (window[i] - half_max) / (window[i] - window[i - 1])
+            left_idx = i - frac
         fwhm_us = (np.nan if (np.isnan(left_idx) or np.isnan(right_idx))
                    else (right_idx - left_idx) / fs * 1e6)
     return height, fwhm_us
