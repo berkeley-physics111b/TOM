@@ -864,52 +864,60 @@ class SignalViewerTab:
                 raw_ch0, fs, first_trig_ch0, trig_ch0, pulses_ch0,
                 start_idx, stop_idx, holdoff_samples, do_filter, b, a_coef)
 
-            if not pass1_ch0:
-                continue
-            self.first_trigger_count += 1
+            if pass1_ch0:
+                self.first_trigger_count += 1
 
-            if not pass2_ch0:
-                continue
-
+            # Ch1 is analysed independently of ch0's outcome — its own
+            # pass/fail must not be gated on whether ch0 qualified.
+            pass1_ch1 = pass2_ch1 = False
+            cross_ch1 = None
             if use_ch1 and item["ch1"] is not None:
                 (pass1_ch1, pass2_ch1, cross_ch1,
                  *_) = analyse_channel(
                     item["ch1"], fs, first_trig_ch1, trig_ch1, pulses_ch1,
                     start_idx, stop_idx, holdoff_samples, do_filter, b, a_coef)
-                if not (pass1_ch1 and pass2_ch1):
-                    continue
 
-                # Trim ch1: pretrig before its own first crossing, up to stop_idx
+            stored_something = False
+            trim_start = trim_end = cross_in = None
+
+            # --- Ch0 recorded on its own merits, independent of ch1 ---
+            if pass1_ch0 and pass2_ch0:
+                trim_start = max(0, cross_ch0 - pretrig_samples)
+                trim_end   = cross_ch0 + stop_idx
+                disp_ch0   = raw_ch0[trim_start:trim_end]
+                cross_in   = cross_ch0 - trim_start
+                new_ch0.append((disp_ch0, cross_in))
+                if self.save_traces_var.get():
+                    trace_rows.append(raw_ch0.tolist())
+                stored_something = True
+
+            # --- Ch1 recorded on its own merits, independent of ch0 ---
+            if use_ch1 and item["ch1"] is not None and pass1_ch1 and pass2_ch1:
                 trim_start_ch1 = max(0, cross_ch1 - pretrig_samples)
                 trim_end_ch1   = cross_ch1 + stop_idx
                 disp_ch1       = item["ch1"][trim_start_ch1:trim_end_ch1]
                 cross_in_ch1   = cross_ch1 - trim_start_ch1
                 new_ch1.append((disp_ch1, cross_in_ch1))
-
                 if self.save_traces_var.get():
                     trace_rows.append(item["ch1"].tolist())
-
-            # Trim ch0: pretrig before first crossing, up to stop_idx from crossing
-            trim_start = max(0, cross_ch0 - pretrig_samples)
-            trim_end   = cross_ch0 + stop_idx
-            disp_ch0   = raw_ch0[trim_start:trim_end]
-            cross_in   = cross_ch0 - trim_start
-            new_ch0.append((disp_ch0, cross_in))
+                stored_something = True
 
             # Ch0 x Ch1 product trace, same trim/alignment as Ch0 (only when
-            # Ch1 is enabled and present — the product needs both channels
-            # from the same shared-buffer acquisition).
-            if use_ch1 and item["ch1"] is not None:
+            # BOTH channels qualify — a product trace from the same
+            # shared-buffer acquisition is genuinely meaningless unless both
+            # channels have a qualifying pulse; this is the one place where
+            # requiring both is correct).
+            if (use_ch1 and item["ch1"] is not None
+                    and pass1_ch0 and pass2_ch0 and pass1_ch1 and pass2_ch1):
                 disp_prod = raw_ch0[trim_start:trim_end] * item["ch1"][trim_start:trim_end]
                 new_prod.append((disp_prod, cross_in))
 
-            self.passing_count += 1
-            if self.save_traces_var.get():
-                trace_rows.append(raw_ch0.tolist())
+            if stored_something:
+                self.passing_count += 1
 
         self.first_trigger_count_var.set(self.first_trigger_count)
 
-        if not new_ch0:
+        if not new_ch0 and not new_ch1:
             return
 
         self.stored_ch0.extend(new_ch0)
@@ -1331,17 +1339,15 @@ class HistogramTab:
                 raw_ch0, fs, first_trig_ch0, trig_ch0, pulses_ch0,
                 start_idx, stop_idx, holdoff_samples, do_filter, b, a_coef)
 
-            if not pass1_ch0:
-                continue
-            self.first_trigger_count += 1
+            if pass1_ch0:
+                self.first_trigger_count += 1
 
-            if not pass2_ch0:
-                continue
-
-            # Ch1
+            # Ch1 is analysed independently of ch0's outcome — its own
+            # pass/fail must not be gated on whether ch0 qualified.
             t1_ch1 = t2_ch1 = dt_ch1 = np.nan
             a1_ch1 = fwhm1_ch1 = a2_ch1 = fwhm2_ch1 = np.nan
             dt_inter = np.nan
+            pass1_ch1 = pass2_ch1 = False
 
             if use_ch1 and item["ch1"] is not None:
                 (pass1_ch1, pass2_ch1, cross_ch1,
@@ -1349,8 +1355,16 @@ class HistogramTab:
                  a1_ch1, fwhm1_ch1, a2_ch1, fwhm2_ch1) = analyse_channel(
                     item["ch1"], fs, first_trig_ch1, trig_ch1, pulses_ch1,
                     start_idx, stop_idx, holdoff_samples, do_filter, b, a_coef)
-                if not (pass1_ch1 and pass2_ch1):
-                    continue
+
+            ch0_ok = pass1_ch0 and pass2_ch0
+            ch1_ok = use_ch1 and pass1_ch1 and pass2_ch1
+
+            # Record the event if EITHER channel independently qualifies.
+            # dt_inter only means anything when both channels fired.
+            if not (ch0_ok or ch1_ok):
+                continue
+
+            if ch0_ok and ch1_ok:
                 dt_inter = t1_ch1 - t1_ch0
 
             self.passing_count += 1
