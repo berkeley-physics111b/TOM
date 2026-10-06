@@ -1548,7 +1548,8 @@ class TomographyAcquisitionManager(AcquisitionManager):
                 )
                 last_afe_config = afe_config
                 if not self.queue.full():
-                    self.queue.put_nowait({"ch0": result[0], "ch1": result[1]})
+                    self.queue.put_nowait({"ch0": result[0], "ch1": result[1],
+                                           "ts":  time.time()})
             except TimeoutError:
                 pass
             except Exception as e:
@@ -1575,16 +1576,29 @@ class TomographyTab:
         product trace -> coincidence
 
     The stoppage (second-pulse) check is NOT done on the product trace,
-    because a stopping muon's decay pulse appears in only ONE of the two
-    detectors — multiplying the channels together would suppress it, since
-    the other channel has no second pulse there and the product stays near
-    zero. Instead, once a coincidence is found, Ch0 and Ch1 are each
-    checked independently for a crossing of the stoppage threshold inside
+    because a stopping muon's decay pulse appears in only ONE detector —
+    multiplying the channels together would suppress it. Instead, once a
+    coincidence is found, only the channel chosen by "Stoppage channel"
+    (default 1) is checked for a crossing of the stoppage threshold inside
     the [window_start, window_stop] window following the coincidence:
-      - a crossing on EITHER channel (Ch0 or Ch1) -> stoppage
+      - a crossing on that channel -> stoppage
+
+    Integration time (min) is used for three things:
+      - width of the time bins in the rate-vs-time plot (raw counts/bin)
+      - the interval over which the displayed coincidence / stoppage rates
+        are computed (the displayed value is the running average of the
+        per-interval rates)
+      - the auto-save cadence (pending records are flushed to the save
+        file every time an integration interval completes)
+    It is locked in at the first Start after launch / Clear, and cannot be
+    changed until Clear.
+
+    The elapsed ("time since start") clock only runs while acquisition is
+    running: Stop freezes it, Start resumes it, Clear resets it to zero.
     """
 
     SAVE_MODES = ["stoppages only", "coincidences only", "all data"]
+    PULSE_REFRESH_S = 1.0    # minimum time between product-pulse redraws
 
     def __init__(self, parent, acq: TomographyAcquisitionManager):
         self.acq     = acq
@@ -1592,22 +1606,37 @@ class TomographyTab:
 
         self.coincidence_count = 0
         self.stoppage_count    = 0
-        self.run_start_time    = None
         self._pending_records  = []   # buffered rows awaiting a save
 
-        # running average of per-interval count rate, kept as two scalars
-        # (cumulative mean) instead of a growing history list
-        self._rate_avg = 0.0
-        self._rate_n   = 0
-        self._interval_start_time  = None
-        self._interval_start_coinc = 0
-        self._interval_start_stop  = 0
+        # elapsed clock: accumulated seconds from earlier Start..Stop
+        # segments, plus the start time of the current segment (None while
+        # stopped)
+        self._elapsed_base = 0.0
+        self._seg_start    = None
 
-        self.save_path      = None
-        self._last_save_pending_count = 0
+        # running average of per-interval rates (two scalars each, instead
+        # of a growing history list)
+        self._rate_avg_c = 0.0
+        self._rate_avg_s = 0.0
+        self._rate_n     = 0
+
+        # current integration bin (in elapsed seconds) and completed bins
+        self._bin_start_s     = 0.0
+        self._bin_start_coinc = 0
+        self._bin_start_stop  = 0
+        self.bins = []   # (t_mid_min, coinc_count, stop_count) per bin
+        self._integration_s = None   # locked at run start; None = not locked
+
+        # product-pulse display (only the most recent pulse is kept)
+        self.latest_prod      = None   # (trimmed_array, cross_in)
+        self._pulse_dirty     = False
+        self._last_pulse_draw = 0.0
+
+        self.save_path = None
 
         # ---- Tk vars: Hardware settings ----
         self.hw_trigger_channel_var = tk.IntVar(value=0)
+        self.stoppage_channel_var   = tk.IntVar(value=1)
         self.hw_trigger_level_var   = tk.DoubleVar(value=0.2)
         self.sample_rate_var        = tk.DoubleVar(value=100e6)
         self.voltage_range_var      = tk.DoubleVar(value=5.0)
@@ -1625,9 +1654,6 @@ class TomographyTab:
         self.save_mode_var             = tk.StringVar(value=self.SAVE_MODES[0])
 
         # ---- Tk vars: Data saving ----
-        self.angle_var           = tk.StringVar(value="")
-        self.height_var          = tk.StringVar(value="")
-        self.notes_var           = tk.StringVar(value="")
         self.integration_min_var = tk.DoubleVar(value=2.0)
         self.save_path_var       = tk.StringVar(value="(no save file set)")
 
@@ -1638,11 +1664,12 @@ class TomographyTab:
         self.stop_count_var   = tk.IntVar(value=0)
         self.elapsed_var      = tk.StringVar(value="00:00:00")
         self.rate_var         = tk.StringVar(value="— counts/min")
-
-        self.max_display = 50
-        self.stored_prod = []   # (trimmed_array, cross_in) for live display
+        self.stop_rate_var    = tk.StringVar(value="— counts/min")
 
         self._build(parent)
+
+        # stoppage line on the rate plot depends on the save mode
+        self.save_mode_var.trace_add("write", lambda *a: self._redraw_rate_plot())
         parent.after(200, self._update_loop)
 
     # ------------------------------------------------------------------
@@ -1656,21 +1683,11 @@ class TomographyTab:
         # ---- 1. Hardware settings ----
         _section_label(frame, "── Hardware Settings ──")
         add_row(frame, "HW trigger channel (0 / 1)", self.hw_trigger_channel_var)
+        add_row(frame, "Stoppage channel (0 / 1)",   self.stoppage_channel_var)
         add_row(frame, "HW trigger level (V)",       self.hw_trigger_level_var)
         add_row(frame, "Sample rate (Hz)",            self.sample_rate_var)
         add_row(frame, "Voltage range (V p-p)",       self.voltage_range_var)
         add_row(frame, "Attenuation",                 self.attenuation_var)
-
-        bf1 = tk.Frame(frame, bg=C["bg"])
-        bf1.pack(fill="x", pady=(8, 2))
-        _button(bf1, "Connect",    self._connect,    width=10).pack(side=tk.LEFT, padx=2)
-        _button(bf1, "Disconnect", self._disconnect, width=10).pack(side=tk.LEFT, padx=2)
-
-        bf2 = tk.Frame(frame, bg=C["bg"])
-        bf2.pack(fill="x", pady=2)
-        _button(bf2, "▶ Start", self._start, width=8).pack(side=tk.LEFT, padx=2)
-        _button(bf2, "■ Stop",  self._stop,  width=8).pack(side=tk.LEFT, padx=2)
-        _button(bf2, "✕ Clear", self._clear, width=8).pack(side=tk.LEFT, padx=2)
 
         # ---- 2. Signal processing ----
         _section_label(frame, "── Signal Processing ──")
@@ -1703,14 +1720,25 @@ class TomographyTab:
                                         font=("Helvetica", 8))
         self.save_path_label.pack(anchor="w")
 
-        add_row(frame, "Angle",  self.angle_var)
-        add_row(frame, "Height", self.height_var)
-        add_row(frame, "Notes",  self.notes_var)
-        add_row(frame, "Integration time (min)", self.integration_min_var)
+        _field_label(frame, "Integration time (min) — locked once run starts")
+        self.integration_entry = _entry(frame, self.integration_min_var)
 
-        _button(frame, "💾 Save", self._manual_save).pack(fill="x", pady=(6, 2))
+        _button(frame, "Export CSV", self._manual_save).pack(fill="x", pady=(6, 2))
 
-        # ---- 5. Status ----
+        # ---- 5. Acquisition controls (directly above Status, as on the
+        #         other tabs) ----
+        bf1 = tk.Frame(frame, bg=C["bg"])
+        bf1.pack(fill="x", pady=(10, 2))
+        _button(bf1, "Connect",    self._connect,    width=10).pack(side=tk.LEFT, padx=2)
+        _button(bf1, "Disconnect", self._disconnect, width=10).pack(side=tk.LEFT, padx=2)
+
+        bf2 = tk.Frame(frame, bg=C["bg"])
+        bf2.pack(fill="x", pady=2)
+        _button(bf2, "▶ Start", self._start, width=8).pack(side=tk.LEFT, padx=2)
+        _button(bf2, "■ Stop",  self._stop,  width=8).pack(side=tk.LEFT, padx=2)
+        _button(bf2, "✕ Clear", self._clear, width=8).pack(side=tk.LEFT, padx=2)
+
+        # ---- 6. Status ----
         _section_label(frame, "── Status ──")
         _status_label(frame, self.status_var).pack(anchor="w", pady=(4, 0))
 
@@ -1736,18 +1764,42 @@ class TomographyTab:
         _stat(1, "Stoppages",          self.stop_count_var)
         _stat(2, "Time since start",   self.elapsed_var)
         _stat(3, "Coincidence rate",   self.rate_var)
+        _stat(4, "Stoppage rate",      self.stop_rate_var)
 
         plot_frame = tk.Frame(main, bg=C["plot_bg"])
-        plot_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+        plot_frame.pack(fill=tk.BOTH, expand=True)
         self.fig    = plt.Figure(figsize=(10, 6))
         _style_figure(self.fig)
         self.canvas = FigureCanvasTkAgg(self.fig, master=plot_frame)
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-        self.ax = self.fig.subplots(1, 1)
-        _style_ax(self.ax, ylabel="Amplitude (V²)",
-                  xlabel="Time relative to coincidence (µs)")
-        self.fig.tight_layout(pad=1.5)
-        self.canvas.draw()
+        # top: rate vs time; bottom: latest product pulse
+        self.ax_rate, self.ax_pulse = self.fig.subplots(
+            2, 1, gridspec_kw={"height_ratios": [1, 1.2]})
+        # fixed margins (tight_layout on every redraw is slow)
+        self.fig.subplots_adjust(left=0.08, right=0.98, top=0.94,
+                                 bottom=0.09, hspace=0.45)
+        self._redraw_rate_plot()
+        self._redraw_pulse_plot()
+
+    # ------------------------------------------------------------------
+    # Elapsed clock (runs only while acquisition is running)
+    # ------------------------------------------------------------------
+
+    def _elapsed(self):
+        if self._seg_start is None:
+            return self._elapsed_base
+        return self._elapsed_base + (time.time() - self._seg_start)
+
+    def _freeze_clock(self):
+        if self._seg_start is not None:
+            self._elapsed_base += time.time() - self._seg_start
+            self._seg_start = None
+        self._show_elapsed()
+
+    def _show_elapsed(self):
+        h, rem = divmod(int(self._elapsed()), 3600)
+        m, s   = divmod(rem, 60)
+        self.elapsed_var.set(f"{h:02d}:{m:02d}:{s:02d}")
 
     # ------------------------------------------------------------------
     # Hardware control
@@ -1768,20 +1820,27 @@ class TomographyTab:
 
     def _disconnect(self):
         self.acq.disconnect()
+        self._freeze_clock()
+        self._flush_if_possible("disconnected")
         self.status_var.set("Disconnected")
 
     def _start(self):
         self._push_to_acq()
         msg = self.acq.start_acquisition()
         self.status_var.set(msg)
-        if self.run_start_time is None:
-            self.run_start_time = time.time()
-            self._interval_start_time  = self.run_start_time
-            self._interval_start_coinc = self.coincidence_count
-            self._interval_start_stop  = self.stoppage_count
+        if self.acq.is_running and self._seg_start is None:
+            self._seg_start = time.time()
+        if self.acq.is_running and self._integration_s is None:
+            # lock the integration time for the whole run
+            self._integration_s = max(1.0, self.integration_min_var.get() * 60.0)
+            self.integration_entry.config(
+                state="disabled", disabledbackground=C["panel"],
+                disabledforeground=C["fg_dim"])
 
     def _stop(self):
         self.acq.stop_acquisition()
+        self._freeze_clock()
+        self._flush_if_possible("stopped")
         self.status_var.set("Acquisition stopped")
 
     def _clear(self):
@@ -1789,21 +1848,30 @@ class TomographyTab:
         self.stoppage_count    = 0
         self.coinc_var.set(0)
         self.stop_count_var.set(0)
-        self.run_start_time = None
+
+        # reset the elapsed clock; if acquisition is still running it
+        # restarts from zero, otherwise it stays at 00:00:00
+        self._elapsed_base = 0.0
+        self._seg_start = time.time() if self.acq.is_running else None
         self.elapsed_var.set("00:00:00")
-        self._rate_avg = 0.0
-        self._rate_n   = 0
+
+        self._rate_avg_c = 0.0
+        self._rate_avg_s = 0.0
+        self._rate_n     = 0
         self.rate_var.set("— counts/min")
-        self._interval_start_time  = None
-        self._interval_start_coinc = 0
-        self._interval_start_stop  = 0
-        self.stored_prod.clear()
+        self.stop_rate_var.set("— counts/min")
+        self._bin_start_s     = 0.0
+        self._bin_start_coinc = 0
+        self._bin_start_stop  = 0
+        self.bins.clear()
+        self._integration_s = None
+        self.integration_entry.config(state="normal")
+
+        self.latest_prod  = None
+        self._pulse_dirty = False
         self._pending_records.clear()
-        self.ax.clear()
-        _style_ax(self.ax, ylabel="Amplitude (V²)",
-                  xlabel="Time relative to coincidence (µs)")
-        self.fig.tight_layout(pad=1.5)
-        self.canvas.draw()
+        self._redraw_rate_plot()
+        self._redraw_pulse_plot()
 
     # ------------------------------------------------------------------
     # Data saving
@@ -1837,8 +1905,22 @@ class TomographyTab:
         except Exception as e:
             self.status_var.set(f"Save error: {e}")
 
+    def _flush_if_possible(self, reason=""):
+        """Flush only if a save file is already set (no nagging otherwise)."""
+        if self.save_path:
+            self._flush_pending(reason=reason)
+
     def _manual_save(self):
-        self._flush_pending(reason="manual save")
+        """Export CSV: write all pending records to the save file, asking
+        for one first if none has been set."""
+        if not self._pending_records:
+            self.status_var.set("Nothing to export (no unsaved records)")
+            return
+        if not self.save_path:
+            self._set_save_path()
+            if not self.save_path:
+                return
+        self._flush_pending(reason="export")
 
     # ------------------------------------------------------------------
     # Acquisition loop
@@ -1849,6 +1931,7 @@ class TomographyTab:
             return
         self._drain_queue()
         self._update_timers_and_rate()
+        self._maybe_redraw_pulse()
         try:
             self.fig.canvas.get_tk_widget().after(200, self._update_loop)
         except Exception:
@@ -1882,17 +1965,19 @@ class TomographyTab:
         if do_filter:
             b, a_coef = sig.butter(4, fc / nyq, btype="low")
 
-        new_prod   = []
+        latest     = None
         new_coinc  = 0
         new_stop   = 0
-        ts_common  = datetime.datetime.now().isoformat(timespec="seconds")
-        angle, height, notes = self.angle_var.get(), self.height_var.get(), self.notes_var.get()
+        stop_ch    = self.stoppage_channel_var.get()
 
         for item in batch:
             ch0, ch1 = item["ch0"], item["ch1"]
             if ch1 is None:
                 continue
             product = ch0 * ch1
+            # capture-completion time, microsecond precision
+            ts = datetime.datetime.fromtimestamp(
+                item.get("ts", time.time())).isoformat(timespec="microseconds")
 
             # Coincidence: first trigger crossing anywhere on the product
             # trace. expected_pulses=1 here — the stoppage (second-pulse)
@@ -1905,141 +1990,158 @@ class TomographyTab:
                 start_idx, stop_idx, holdoff_samples, do_filter, b, a_coef)
 
             if not pass1:
-                if save_mode == "all data":
-                    self._pending_records.append({
-                        "timestamp": ts_common, "angle": angle, "height": height,
-                        "notes": notes, "event_type": "no_coincidence",
-                        "t1_us": np.nan, "t2_us": np.nan, "dt_us": np.nan,
-                        "peak1_v": np.nan, "peak1_fwhm_us": np.nan,
-                        "peak2_v": np.nan, "peak2_fwhm_us": np.nan,
-                        "stopped_channel": "",
-                        "product_max_v2": float(np.max(product)),
-                    })
                 continue
 
             new_coinc += 1
 
-            # Stoppage: check Ch0 and Ch1 individually for the second-pulse
-            # crossing in the window, since a stopping muon's decay pulse
-            # appears in only one detector — checking the product would
-            # suppress it. Either channel crossing counts as a stoppage.
-            found0, t2_0, a2_0, fwhm2_0 = find_stoppage_in_channel(
-                ch0, fs, cross, stop_thresh, start_idx, stop_idx,
+            # Stoppage: checked on ONE channel only (Stoppage channel
+            # setting), since a stopping muon's decay pulse appears in one
+            # detector; the product would suppress it.
+            stop_trace = ch0 if stop_ch == 0 else ch1
+            is_stoppage, t2, a2, fwhm2 = find_stoppage_in_channel(
+                stop_trace, fs, cross, stop_thresh, start_idx, stop_idx,
                 do_filter, b, a_coef)
-            found1, t2_1, a2_1, fwhm2_1 = find_stoppage_in_channel(
-                ch1, fs, cross, stop_thresh, start_idx, stop_idx,
-                do_filter, b, a_coef)
-
-            is_stoppage = found0 or found1
-            if found0 and found1:
-                # both channels show a second pulse (unusual) — report
-                # whichever crossed first
-                if t2_0 <= t2_1:
-                    t2, a2, fwhm2, stopped_channel = t2_0, a2_0, fwhm2_0, "ch0"
-                else:
-                    t2, a2, fwhm2, stopped_channel = t2_1, a2_1, fwhm2_1, "ch1"
-            elif found0:
-                t2, a2, fwhm2, stopped_channel = t2_0, a2_0, fwhm2_0, "ch0"
-            elif found1:
-                t2, a2, fwhm2, stopped_channel = t2_1, a2_1, fwhm2_1, "ch1"
-            else:
-                t2, a2, fwhm2, stopped_channel = np.nan, np.nan, np.nan, ""
 
             dt = (t2 - t1) if is_stoppage else np.nan
 
             if is_stoppage:
                 new_stop += 1
 
-            # trim for the live display, aligned to the coincidence crossing
+            # keep only the most recent coincidence for the live display,
+            # trimmed and aligned to the coincidence crossing
             trim_start = max(0, cross - pretrig_samples)
             trim_end   = cross + stop_idx
-            new_prod.append((product[trim_start:trim_end], cross - trim_start))
+            latest = (product[trim_start:trim_end], cross - trim_start)
 
             event_type = "stoppage" if is_stoppage else "coincidence"
             should_log = (
                 save_mode == "all data" or
-                (save_mode == "coincidences only") or
-                (save_mode == "stoppages only" and is_stoppage)
+                (save_mode == "stoppages only" and is_stoppage) or
+                (save_mode == "coincidences only" and not is_stoppage)
             )
             if should_log:
                 self._pending_records.append({
-                    "timestamp": ts_common, "angle": angle, "height": height,
-                    "notes": notes, "event_type": event_type,
+                    "timestamp": ts, "event_type": event_type,
                     "t1_us": t1, "t2_us": t2, "dt_us": dt,
                     "peak1_v": a1, "peak1_fwhm_us": fwhm1,
                     "peak2_v": a2, "peak2_fwhm_us": fwhm2,
-                    "stopped_channel": stopped_channel,
                     "product_max_v2": float(np.max(product)),
                 })
 
-        if new_coinc == 0 and new_stop == 0 and not new_prod:
-            return
+        if new_coinc or new_stop:
+            self.coincidence_count += new_coinc
+            self.stoppage_count    += new_stop
+            self.coinc_var.set(self.coincidence_count)
+            self.stop_count_var.set(self.stoppage_count)
 
-        self.coincidence_count += new_coinc
-        self.stoppage_count    += new_stop
-        self.coinc_var.set(self.coincidence_count)
-        self.stop_count_var.set(self.stoppage_count)
-
-        if new_prod:
-            self.stored_prod.extend(new_prod)
-            self._update_plot(fs)
-
-    def _update_plot(self, fs):
-        self.ax.clear()
-        _style_ax(self.ax, title=f"Ch0 × Ch1 product — "
-                       f"last {min(len(self.stored_prod), self.max_display)} coincidences",
-                  ylabel="Amplitude (V²)",
-                  xlabel="Time relative to coincidence (µs)")
-        recent = self.stored_prod[-self.max_display:]
-        for (trace, cross_in) in recent:
-            t_us = (np.arange(len(trace)) - cross_in) / fs * 1e6
-            self.ax.plot(t_us, trace, color=C["trace_prod"], alpha=0.4, linewidth=0.7)
-        self.ax.axhline(self.coincidence_threshold_var.get(), color=C["coinc_line"],
-                         linestyle="--", linewidth=1.0, label="Coincidence threshold")
-        self.ax.axhline(self.stoppage_threshold_var.get(), color=C["stop_line"],
-                         linestyle="--", linewidth=1.0, label="Stoppage threshold")
-        self.ax.axvline(self.start_us_var.get(), color=C["win_start"], linestyle="--",
-                         linewidth=0.8, label="Window start")
-        self.ax.legend(fontsize=7, facecolor=C["panel"],
-                        edgecolor=C["border"], labelcolor=C["fg"])
-        self.fig.tight_layout(pad=1.5)
-        self.canvas.draw()
+        if latest is not None:
+            # just store it; the plot is redrawn on a slow timer
+            self.latest_prod  = latest
+            self._pulse_dirty = True
 
     # ------------------------------------------------------------------
-    # Timers, rolling count-rate, periodic auto-save
+    # Plots
+    # ------------------------------------------------------------------
+
+    def _show_stoppages_in_plot(self):
+        return self.save_mode_var.get() in ("stoppages only", "all data")
+
+    def _redraw_rate_plot(self):
+        ax = self.ax_rate
+        ax.clear()
+        if self._integration_s is not None:
+            title = f"Counts per {self._integration_s / 60.0:g} min bin"
+        else:
+            title = "Counts per integration-time bin"
+        _style_ax(ax, title=title,
+                  xlabel="Time since start (min)", ylabel="Counts per bin")
+        if self.bins:
+            t  = [b[0] for b in self.bins]
+            rc = [b[1] for b in self.bins]
+            ax.plot(t, rc, color=C["coinc_line"], marker="o", markersize=4,
+                    linewidth=1.2, label="Coincidences")
+            if self._show_stoppages_in_plot():
+                rs = [b[2] for b in self.bins]
+                ax.plot(t, rs, color=C["stop_line"], marker="o", markersize=4,
+                        linewidth=1.2, label="Stoppages")
+            ax.set_ylim(bottom=0)
+            ax.legend(fontsize=7, facecolor=C["panel"],
+                      edgecolor=C["border"], labelcolor=C["fg"])
+        self.canvas.draw_idle()
+
+    def _redraw_pulse_plot(self):
+        ax = self.ax_pulse
+        ax.clear()
+        _style_ax(ax, title="Ch0 × Ch1 product — most recent coincidence",
+                  ylabel="Amplitude (V²)",
+                  xlabel="Time relative to coincidence (µs)")
+        fs = self.sample_rate_var.get()
+        if self.latest_prod is not None:
+            trace, cross_in = self.latest_prod
+            t_us = (np.arange(len(trace)) - cross_in) / fs * 1e6
+            ax.plot(t_us, trace, color=C["trace_prod"], linewidth=0.9)
+        ax.axhline(self.coincidence_threshold_var.get(), color=C["coinc_line"],
+                   linestyle="--", linewidth=1.0, label="Coincidence threshold")
+        ax.axhline(self.stoppage_threshold_var.get(), color=C["stop_line"],
+                   linestyle="--", linewidth=1.0, label="Stoppage threshold")
+        ax.axvline(self.start_us_var.get(), color=C["win_start"], linestyle="--",
+                   linewidth=0.8, label="Window start")
+        ax.legend(fontsize=7, facecolor=C["panel"],
+                  edgecolor=C["border"], labelcolor=C["fg"])
+        self.canvas.draw_idle()
+
+    def _maybe_redraw_pulse(self):
+        """Redraw the single product pulse at most once per PULSE_REFRESH_S."""
+        if not self._pulse_dirty:
+            return
+        now = time.time()
+        if now - self._last_pulse_draw < self.PULSE_REFRESH_S:
+            return
+        self._last_pulse_draw = now
+        self._pulse_dirty = False
+        self._redraw_pulse_plot()
+
+    # ------------------------------------------------------------------
+    # Timers, rolling count-rates, periodic auto-save
     # ------------------------------------------------------------------
 
     def _update_timers_and_rate(self):
-        if self.run_start_time is None:
+        if self._seg_start is None:
+            return          # stopped / not started: clock and bins frozen
+
+        self._show_elapsed()
+
+        if self._integration_s is None:
+            return
+        integration_s = self._integration_s
+        elapsed       = self._elapsed()
+        if elapsed - self._bin_start_s < integration_s:
             return
 
-        elapsed = time.time() - self.run_start_time
-        h, rem = divmod(int(elapsed), 3600)
-        m, s   = divmod(rem, 60)
-        self.elapsed_var.set(f"{h:02d}:{m:02d}:{s:02d}")
+        n_c = self.coincidence_count - self._bin_start_coinc
+        n_s = self.stoppage_count    - self._bin_start_stop
+        minutes = integration_s / 60.0
+        rate_c  = n_c / minutes
+        rate_s  = n_s / minutes
 
-        integration_s = max(1e-6, self.integration_min_var.get() * 60.0)
-        if self._interval_start_time is None:
-            self._interval_start_time  = time.time()
-            self._interval_start_coinc = self.coincidence_count
-            return
+        # cumulative (running) averages — no history list kept for these
+        self._rate_n += 1
+        self._rate_avg_c += (rate_c - self._rate_avg_c) / self._rate_n
+        self._rate_avg_s += (rate_s - self._rate_avg_s) / self._rate_n
+        self.rate_var.set(f"{self._rate_avg_c:.3g} counts/min")
+        self.stop_rate_var.set(f"{self._rate_avg_s:.3g} counts/min")
 
-        interval_elapsed = time.time() - self._interval_start_time
-        if interval_elapsed >= integration_s:
-            interval_count = self.coincidence_count - self._interval_start_coinc
-            interval_rate  = interval_count / (interval_elapsed / 60.0)
+        # completed bin: raw counts, plotted at the bin centre
+        t_mid_min = (self._bin_start_s + integration_s / 2.0) / 60.0
+        self.bins.append((t_mid_min, n_c, n_s))
+        self._redraw_rate_plot()
 
-            # cumulative (running) average — no history list kept in memory
-            self._rate_n += 1
-            self._rate_avg += (interval_rate - self._rate_avg) / self._rate_n
-            self.rate_var.set(f"{self._rate_avg:.3g} counts/min")
+        # integration time also sets the auto-save cadence
+        self._flush_pending(reason="auto-save")
 
-            # integration time also sets the auto-save cadence
-            self._flush_pending(reason="auto-save")
-
-            self._interval_start_time  = time.time()
-            self._interval_start_coinc = self.coincidence_count
-            self._interval_start_stop  = self.stoppage_count
+        self._bin_start_s    += integration_s
+        self._bin_start_coinc = self.coincidence_count
+        self._bin_start_stop  = self.stoppage_count
 
 
 # ===========================================================================
