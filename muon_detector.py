@@ -561,6 +561,22 @@ def find_stoppage_in_channel(raw, fs, cross, second_trig,
     return True, t2_us, a2, fwhm2_us
 
 
+def measure_pulse1_in_channel(raw, fs, cross, start_idx,
+                              do_filter, b=None, a_coef=None):
+    """
+    Pulse-1 height and FWHM of a SINGLE channel's own trace, measured on
+    the region from `cross` (the coincidence crossing index found on the
+    product trace) up to `start_idx` -- the same region and filtering that
+    analyse_channel uses for its pulse-1 metrics.
+
+    Returns (height, fwhm_us); (NaN, NaN) if the region is empty.
+    """
+    win  = raw[cross:][:start_idx]
+    filt = (sig.filtfilt(b, a_coef, win)
+            if (do_filter and len(win) > 9) else win.copy())
+    return measure_pulse(filt, fs, half_width_only=True)
+
+
 # ===========================================================================
 # ADS / Acquisition panel  (merged – no separate ADS Hardware section)
 # ===========================================================================
@@ -1985,7 +2001,8 @@ class TomographyTab:
             # product (see class docstring for why).
             (pass1, _pass2_unused, cross,
              t1, _t2_unused, _dt_unused,
-             a1, fwhm1, _a2_unused, _fwhm2_unused) = analyse_channel(
+             _a1_unused, product_fwhm,
+             _a2_unused, _fwhm2_unused) = analyse_channel(
                 product, fs, coinc_thresh, stop_thresh, 1,
                 start_idx, stop_idx, holdoff_samples, do_filter, b, a_coef)
 
@@ -2002,7 +2019,13 @@ class TomographyTab:
                 stop_trace, fs, cross, stop_thresh, start_idx, stop_idx,
                 do_filter, b, a_coef)
 
-            dt = (t2 - t1) if is_stoppage else np.nan
+            # Pulse 1 on each channel's own trace. "ch2" = the stoppage
+            # channel, "ch1" = the other (non-stoppage) channel.
+            nonstop_trace = ch1 if stop_ch == 0 else ch0
+            p1_ch1, p1_ch1_fwhm = measure_pulse1_in_channel(
+                nonstop_trace, fs, cross, start_idx, do_filter, b, a_coef)
+            p1_ch2, p1_ch2_fwhm = measure_pulse1_in_channel(
+                stop_trace, fs, cross, start_idx, do_filter, b, a_coef)
 
             if is_stoppage:
                 new_stop += 1
@@ -2022,10 +2045,12 @@ class TomographyTab:
             if should_log:
                 self._pending_records.append({
                     "timestamp": ts, "event_type": event_type,
-                    "t1_us": t1, "t2_us": t2, "dt_us": dt,
-                    "peak1_v": a1, "peak1_fwhm_us": fwhm1,
-                    "peak2_v": a2, "peak2_fwhm_us": fwhm2,
+                    "t1_us": t1, "t2_us": t2,
+                    "peak1_ch1_v": p1_ch1, "peak1_ch1_fwhm_us": p1_ch1_fwhm,
+                    "peak1_ch2_v": p1_ch2, "peak1_ch2_fwhm_us": p1_ch2_fwhm,
+                    "peak2_ch2_v": a2, "peak2_ch2_fwhm_us": fwhm2,
                     "product_max_v2": float(np.max(product)),
+                    "product_fwhm_us": product_fwhm,
                 })
 
         if new_coinc or new_stop:
